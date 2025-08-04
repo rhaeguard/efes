@@ -2,9 +2,15 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
+	"fmt"
 	"io"
 	"io/fs"
+	"log"
+	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -21,14 +27,16 @@ const FILENAME_LENGTH_LIMIT = 128
 const MAX_FILECOUNT = 200
 const BLOCK_SIZE = 4 * 1024 // 4 kb
 
+var Endianness = binary.LittleEndian
+
+type Efes struct {
+	files [MAX_FILECOUNT]efesFileEntry
+	data  efesDataSector
+}
+
 type efesFileEntry struct {
 	name         [FILENAME_LENGTH_LIMIT]byte // limit size, maybe bytes?
 	firstBlockIx uint16                      // index of the block in data sector
-}
-
-type efesDataBlock struct {
-	nextDataBlockIx uint16
-	data            [BLOCK_SIZE]byte
 }
 
 type efesDataSector struct {
@@ -36,29 +44,9 @@ type efesDataSector struct {
 	blocks          []efesDataBlock
 }
 
-type Efes struct {
-	files [MAX_FILECOUNT]efesFileEntry
-	data  efesDataSector
-}
-
-func (fsys Efes) getDirectory(name string) *efesFile {
-	if name == "." || name == "./" {
-		curDir := newFile(".", &fsys, 13) // rand number
-		curDir.isDir = true
-		curDir.returnedDirIndex = -1
-		curDir.fileInfo.mode = fs.ModeDir
-
-		for fsysIx, file := range fsys.files {
-			if file.firstBlockIx == 0 {
-				continue
-			}
-			curDir.children = append(curDir.children, newFile(filenameFromFixedBytes(file.name), &fsys, fsysIx))
-		}
-
-		return &curDir
-	}
-
-	return nil
+type efesDataBlock struct {
+	nextDataBlockIx uint16
+	data            [BLOCK_SIZE]byte
 }
 
 type efesFileInfo struct {
@@ -66,6 +54,98 @@ type efesFileInfo struct {
 	size    int64
 	modTime time.Time
 	mode    fs.FileMode
+}
+
+const SizeOf_efesFileEntry = 130
+const SizeOf_efesDataBlock = 4098
+
+func NewEfesFileSystem(filepath string) (*Efes, error) {
+	fd, err := os.Open(filepath)
+	if err != nil {
+		return nil, err
+	}
+	fsys := Efes{}
+	metadataBytes := make([]byte, MAX_FILECOUNT*SizeOf_efesFileEntry)
+	if rb, err := fd.Read(metadataBytes); err != nil || rb != MAX_FILECOUNT*SizeOf_efesFileEntry {
+		return nil, err
+	}
+	for i := range MAX_FILECOUNT - 1 {
+		aFileEntry := metadataBytes[i*SizeOf_efesFileEntry : (i+1)*SizeOf_efesFileEntry]
+		fsys.files[i].name = [FILENAME_LENGTH_LIMIT]byte(aFileEntry[0:FILENAME_LENGTH_LIMIT])
+		fsys.files[i].firstBlockIx = Endianness.Uint16(aFileEntry[FILENAME_LENGTH_LIMIT : FILENAME_LENGTH_LIMIT+2])
+	}
+
+	totalBlockCountBytes := make([]byte, 2)
+	if rb, err := fd.Read(totalBlockCountBytes); err != nil || rb != 2 {
+		return nil, err
+	}
+	totalBlockCount := Endianness.Uint16(totalBlockCountBytes)
+	fsys.data.totalBlockCount = totalBlockCount
+
+	dataRawBytes := make([]byte, totalBlockCount*SizeOf_efesDataBlock)
+	if rb, err := fd.Read(dataRawBytes); err != nil || rb != int(totalBlockCount)*SizeOf_efesDataBlock {
+		return nil, err
+	}
+
+	for i := range totalBlockCount {
+		aDataEntry := dataRawBytes[i*SizeOf_efesDataBlock : (i+1)*SizeOf_efesDataBlock]
+		nextDataBlockIx := Endianness.Uint16(aDataEntry[0:2])
+		data := [BLOCK_SIZE]byte(aDataEntry[2:])
+		fsys.data.blocks = append(fsys.data.blocks, efesDataBlock{
+			nextDataBlockIx: nextDataBlockIx,
+			data:            data,
+		})
+	}
+
+	return &fsys, nil
+}
+
+func (fsys *Efes) SizeInBytes() int {
+	totalSize := SizeOf_efesFileEntry * MAX_FILECOUNT
+	totalSize += (int(fsys.data.totalBlockCount) * SizeOf_efesDataBlock)
+	return totalSize
+}
+
+func (fsys *Efes) Serialize(path string) error {
+	fd, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
+	if err != nil {
+		return err
+	}
+	defer fd.Close()
+
+	if err := fd.Truncate(int64(fsys.SizeInBytes())); err != nil {
+		return err
+	}
+
+	for _, f := range fsys.files {
+		fd.Write(f.GetBytes())
+	}
+	fd.Write(fsys.data.GetBytes())
+	return nil
+}
+
+func (fe efesFileEntry) GetBytes() []byte {
+	feBytes := make([]byte, SizeOf_efesFileEntry)
+	copy(feBytes[:FILENAME_LENGTH_LIMIT], fe.name[:])
+	Endianness.PutUint16(feBytes[FILENAME_LENGTH_LIMIT:], fe.firstBlockIx)
+	return feBytes
+}
+
+func (feds efesDataSector) GetBytes() []byte {
+	totalSize := (feds.totalBlockCount * SizeOf_efesDataBlock) + 2 // 2 for totalBlockCount uint16
+	fedsBytes := make([]byte, totalSize)
+	Endianness.PutUint16(fedsBytes[:2], feds.totalBlockCount)
+
+	dataSectorBytes := fedsBytes[2:]
+	for i := range feds.totalBlockCount {
+		st := int(SizeOf_efesDataBlock * i)
+		end := st + SizeOf_efesDataBlock
+		block := feds.blocks[i]
+		Endianness.PutUint16(dataSectorBytes[st:st+2], block.nextDataBlockIx)
+		copy(dataSectorBytes[st+2:end], block.data[:])
+	}
+
+	return fedsBytes
 }
 
 func newEfesFileInfo(name string, size int64, mode fs.FileMode) efesFileInfo {
@@ -216,14 +296,100 @@ func (fsys Efes) ReadDir(name string) ([]fs.DirEntry, error) {
 	return nil, nil
 }
 
+func (fsys Efes) getDirectory(name string) *efesFile {
+	if name == "." || name == "./" {
+		curDir := newFile(".", &fsys, 13) // rand number
+		curDir.isDir = true
+		curDir.returnedDirIndex = -1
+		curDir.fileInfo.mode = fs.ModeDir
+
+		for fsysIx, file := range fsys.files {
+			if file.firstBlockIx == 0 {
+				continue
+			}
+			curDir.children = append(curDir.children, newFile(filenameFromFixedBytes(file.name), &fsys, fsysIx))
+		}
+
+		return &curDir
+	}
+
+	return nil
+}
+
 func main() {
-	// fileref, err := os.OpenFile("./virtual_file.img", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
+	efes, err := NewEfesFileSystem("./virtual.img")
+	if err != nil {
+		panic(err.Error())
+	}
 
-	// if err != nil {
-	// 	panic("file not opened")
-	// }
+	const useFileServer = false
+	if useFileServer {
+		Serve(efes)
+	} else {
+		CliInteraction(efes)
+	}
+}
 
-	// fileref.Truncate(10 * 1024 * 1024) // 10MB
+func Serve(fsys fs.FS) {
+	http.Handle("/", http.FileServer(http.FS(fsys)))
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
 
-	// defer fileref.Close()
+func CliInteraction(efes *Efes) {
+	var currentlyOpenFile fs.File = nil
+
+	for {
+		fmt.Print("> ")
+		var line string
+		fmt.Scanln(&line)
+
+		if line == "files" {
+			for i, file := range efes.files {
+				if file.firstBlockIx == 0 {
+					continue
+				}
+				fmt.Printf("%3d. %s\n", i, filenameFromFixedBytes(file.name))
+			}
+
+		} else if strings.HasPrefix(line, "file:") {
+			filename := strings.TrimSpace(line[5:])
+			for ix, file := range efes.files {
+				if filenameFromFixedBytes(file.name) == filename {
+					file := newFile(filename, efes, ix)
+					fmt.Printf("Name: %s\n", file.filename)
+					fmt.Printf("Size: %d\n", file.fileInfo.size)
+					fmt.Printf(" Dir: %t\n", file.fileInfo.IsDir())
+				}
+			}
+		} else if strings.HasPrefix(line, "open:") {
+			// open:hi.txt
+			filename := strings.TrimSpace(line[5:])
+			fd, err := efes.Open(filename)
+
+			if err != nil {
+				fmt.Printf("could not open the file: %s\n", err.Error())
+				continue
+			}
+			currentlyOpenFile = fd
+			fmt.Printf("Now open: %s\n", filename)
+		} else if strings.HasPrefix(line, "print:") {
+			// print:150
+			bytesAmount, _ := strconv.Atoi(strings.TrimSpace(line[6:]))
+
+			requestedBytes := make([]byte, bytesAmount)
+			bytesAmount, err := currentlyOpenFile.Read(requestedBytes)
+
+			if err != nil {
+				fmt.Printf("could not read the file[%d]: %s\n", bytesAmount, err.Error())
+				continue
+			}
+
+			fmt.Printf("%s\n", string(requestedBytes))
+		} else if strings.HasPrefix(line, "quit") {
+			fmt.Println("quitting")
+			break
+		} else {
+			fmt.Printf("unrecognized command: %s\n", line)
+		}
+	}
 }

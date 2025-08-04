@@ -5,7 +5,7 @@ an attempt to create a simple file system.
 ### todo
 
 - [ ] create a file
-- [ ] read a file
+- [x] read a file
 - [ ] delete a file
 - [ ] copy a file
 - [ ] move/rename a file
@@ -20,7 +20,8 @@ Current structure:
     "files": [
         {
             "name": "hello.txt",
-            "first_block_ix": 10
+            "first_block_ix": 10,
+            "size": 11, // uint32
         }
     ],
     "data": {
