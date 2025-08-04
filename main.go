@@ -95,6 +95,7 @@ type efesFile struct {
 	fsys             *Efes
 	fsysIx           int
 	offset           int
+	blockIx          uint16
 }
 
 func newFile(filename string, fsys *Efes, fsysIx int) efesFile {
@@ -117,6 +118,7 @@ func newFile(filename string, fsys *Efes, fsysIx int) efesFile {
 		fsys:             fsys,
 		fsysIx:           fsysIx,
 		offset:           0,
+		blockIx:          me.firstBlockIx,
 	}
 }
 
@@ -125,19 +127,36 @@ func (f *efesFile) Stat() (fs.FileInfo, error) {
 }
 
 func (f *efesFile) Read(p []byte) (int, error) {
-	me := f.fsys.files[f.fsysIx]
-	block := f.fsys.data.blocks[me.firstBlockIx]
+	block := f.fsys.data.blocks[f.blockIx]
 
-	copySize := min(len(block.data)-f.offset, len(p))
-	if f.offset == len(block.data) {
-		return 0, io.EOF
-	}
+	requestedSize := len(p)
+	availableInBlock := len(block.data) - f.offset
+
+	copySize := min(availableInBlock, requestedSize)
 	copy(p, block.data[f.offset:f.offset+copySize])
+
 	f.offset += copySize
-	return copySize, nil
+	isEof := block.nextDataBlockIx == 0 && f.offset == BLOCK_SIZE
+	diff := requestedSize - copySize
+
+	if diff == 0 {
+		if isEof {
+			return copySize, io.EOF
+		}
+		return copySize, nil
+	} else {
+		if isEof {
+			return copySize, io.EOF
+		}
+		f.blockIx = block.nextDataBlockIx
+		f.offset = 0
+		subsequentCopySize, err := f.Read(p[copySize:])
+		return subsequentCopySize + copySize, err
+	}
 }
 
 func (f *efesFile) Close() error { return nil }
+
 func (f *efesFile) ReadDir(n int) ([]fs.DirEntry, error) {
 	fileInfos := []fs.DirEntry{}
 
