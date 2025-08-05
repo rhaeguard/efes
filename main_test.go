@@ -96,8 +96,10 @@ func TestEfesReadFile(t *testing.T) {
 func TestEfesSerde(t *testing.T) {
 	fsys := Efes{}
 	fsys.files[0].firstBlockIx = 1
+	fsys.files[0].size = 4 * BLOCK_SIZE
 	fsys.files[0].name = filename("foo/alice_part_1.txt")
 	fsys.files[1].firstBlockIx = 2
+	fsys.files[1].size = 5 * BLOCK_SIZE
 	fsys.files[1].name = filename("foo/bar/alice_part_2.txt")
 	fsys.data.totalBlockCount = 11
 

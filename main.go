@@ -34,11 +34,12 @@ type Efes struct {
 	data  efesDataSector
 }
 
-const SizeOf_efesFileEntry = 130
+const SizeOf_efesFileEntry = 136
 
 type efesFileEntry struct {
-	name         [FILENAME_LENGTH_LIMIT]byte // limit size, maybe bytes?
-	firstBlockIx uint16                      // index of the block in data sector
+	name         [FILENAME_LENGTH_LIMIT]byte
+	firstBlockIx uint16 // index of the block in data sector
+	size         uint32 // filesize
 }
 
 const SizeOf_efesDataBlock = 4098
@@ -74,6 +75,7 @@ func NewEfesFileSystem(filepath string) (*Efes, error) {
 		aFileEntry := metadataBytes[i*SizeOf_efesFileEntry : (i+1)*SizeOf_efesFileEntry]
 		fsys.files[i].name = [FILENAME_LENGTH_LIMIT]byte(aFileEntry[0:FILENAME_LENGTH_LIMIT])
 		fsys.files[i].firstBlockIx = Endianness.Uint16(aFileEntry[FILENAME_LENGTH_LIMIT : FILENAME_LENGTH_LIMIT+2])
+		fsys.files[i].size = Endianness.Uint32(aFileEntry[FILENAME_LENGTH_LIMIT+2:])
 	}
 
 	totalBlockCountBytes := make([]byte, 2)
@@ -128,7 +130,8 @@ func (fsys *Efes) Serialize(path string) error {
 func (fe efesFileEntry) GetBytes() []byte {
 	feBytes := make([]byte, SizeOf_efesFileEntry)
 	copy(feBytes[:FILENAME_LENGTH_LIMIT], fe.name[:])
-	Endianness.PutUint16(feBytes[FILENAME_LENGTH_LIMIT:], fe.firstBlockIx)
+	Endianness.PutUint16(feBytes[FILENAME_LENGTH_LIMIT:FILENAME_LENGTH_LIMIT+2], fe.firstBlockIx)
+	Endianness.PutUint32(feBytes[FILENAME_LENGTH_LIMIT+2:], fe.size)
 	return feBytes
 }
 
@@ -362,7 +365,7 @@ func main() {
 		panic(err.Error())
 	}
 
-	const useFileServer = true
+	const useFileServer = false
 	if useFileServer {
 		Serve(efes)
 	} else {
