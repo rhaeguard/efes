@@ -34,10 +34,14 @@ type Efes struct {
 	data  efesDataSector
 }
 
+const SizeOf_efesFileEntry = 130
+
 type efesFileEntry struct {
 	name         [FILENAME_LENGTH_LIMIT]byte // limit size, maybe bytes?
 	firstBlockIx uint16                      // index of the block in data sector
 }
+
+const SizeOf_efesDataBlock = 4098
 
 type efesDataSector struct {
 	totalBlockCount uint16
@@ -55,9 +59,6 @@ type efesFileInfo struct {
 	modTime time.Time
 	mode    fs.FileMode
 }
-
-const SizeOf_efesFileEntry = 130
-const SizeOf_efesDataBlock = 4098
 
 func NewEfesFileSystem(filepath string) (*Efes, error) {
 	fd, err := os.Open(filepath)
@@ -178,7 +179,7 @@ type efesFile struct {
 	blockIx          uint16
 }
 
-func newFile(filename string, fsys *Efes, fsysIx int) efesFile {
+func newFile(filename string, fsys *Efes, fsysIx int) *efesFile {
 	me := fsys.files[fsysIx]
 	size := 0
 	nextBlockIx := me.firstBlockIx
@@ -191,7 +192,7 @@ func newFile(filename string, fsys *Efes, fsysIx int) efesFile {
 		nextBlockIx = block.nextDataBlockIx
 	}
 
-	return efesFile{
+	return &efesFile{
 		filename:         filename,
 		fileInfo:         newEfesFileInfo(filename, int64(size), fs.FileMode(0)),
 		returnedDirIndex: -1,
@@ -199,6 +200,19 @@ func newFile(filename string, fsys *Efes, fsysIx int) efesFile {
 		fsysIx:           fsysIx,
 		offset:           0,
 		blockIx:          me.firstBlockIx,
+	}
+}
+
+func newDirectory(directoryName string, fsys *Efes) *efesFile {
+	return &efesFile{
+		filename:         directoryName,
+		fileInfo:         newEfesFileInfo(directoryName, int64(0), fs.ModeDir),
+		returnedDirIndex: -1,
+		fsys:             fsys,
+		fsysIx:           0,
+		offset:           0,
+		blockIx:          0,
+		isDir:            false,
 	}
 }
 
@@ -238,6 +252,8 @@ func (f *efesFile) Read(p []byte) (int, error) {
 func (f *efesFile) Close() error { return nil }
 
 func (f *efesFile) ReadDir(n int) ([]fs.DirEntry, error) {
+	fmt.Printf("FileReadDir: %d\n", n)
+
 	fileInfos := []fs.DirEntry{}
 
 	if n <= 0 {
@@ -273,13 +289,14 @@ func (fsys Efes) Open(name string) (fs.File, error) {
 		theName := filenameFromFixedBytes(fileEntry.name)
 		if theName == name {
 			f := newFile(theName, &fsys, fsysIx)
-			return &f, nil
+			return f, nil
 		}
 	}
 	return nil, os.ErrNotExist
 }
 
 func (fsys Efes) ReadDir(name string) ([]fs.DirEntry, error) {
+	fmt.Printf("ReadDir: %s\n", name)
 	if dir := fsys.getDirectory(name); dir != nil {
 		fileInfos := []fs.DirEntry{}
 
@@ -297,20 +314,43 @@ func (fsys Efes) ReadDir(name string) ([]fs.DirEntry, error) {
 }
 
 func (fsys Efes) getDirectory(name string) *efesFile {
-	if name == "." || name == "./" {
-		curDir := newFile(".", &fsys, 13) // rand number
-		curDir.isDir = true
-		curDir.returnedDirIndex = -1
-		curDir.fileInfo.mode = fs.ModeDir
+	var parentFolder string
 
-		for fsysIx, file := range fsys.files {
-			if file.firstBlockIx == 0 {
-				continue
-			}
-			curDir.children = append(curDir.children, newFile(filenameFromFixedBytes(file.name), &fsys, fsysIx))
+	if name == "." {
+		parentFolder = ""
+	} else {
+		parentFolder = name + "/"
+	}
+
+	curDir := newDirectory(parentFolder, &fsys)
+	seenDir := map[string]bool{}
+
+	for fsysIx, file := range fsys.files {
+		if file.firstBlockIx == 0 {
+			continue
 		}
+		childName := filenameFromFixedBytes(file.name)
+		if strings.HasPrefix(childName, parentFolder) {
+			childName = childName[len(parentFolder):]
+			var child *efesFile
 
-		return &curDir
+			if ix := strings.Index(childName, "/"); ix != -1 {
+				dirName := childName[:ix]
+				if ok := seenDir[dirName]; ok {
+					continue
+				}
+				seenDir[dirName] = true
+				child = newDirectory(dirName, &fsys)
+			} else {
+				child = newFile(childName, &fsys, fsysIx)
+			}
+
+			curDir.children = append(curDir.children, *child)
+		}
+	}
+
+	if len(curDir.children) > 0 {
+		return curDir
 	}
 
 	return nil
@@ -322,7 +362,7 @@ func main() {
 		panic(err.Error())
 	}
 
-	const useFileServer = false
+	const useFileServer = true
 	if useFileServer {
 		Serve(efes)
 	} else {

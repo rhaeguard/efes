@@ -22,6 +22,16 @@ Current structure:
             "name": "hello.txt",
             "first_block_ix": 10,
             "size": 11, // uint32
+        },
+        {
+            "name": "foo/bar/hello.txt",
+            "first_block_ix": 10,
+            "size": 11, // uint32
+        },
+        {
+            "name": "foo/baz/", // empty dir
+            "first_block_ix": 0,
+            "size": 11, // uint32
         }
     ],
     "data": {
